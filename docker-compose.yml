@@ -1,0 +1,31 @@
+version: '3'
+
+services:
+
+  partition:
+    build:
+      context: ./
+      dockerfile: docker/Dockerfile
+    container_name: bq_partition
+    entrypoint: "/code/partition.sh"
+
+  sync:
+    build:
+      context: ./
+      dockerfile: docker/Dockerfile
+    container_name: bq_sync
+    entrypoint: "/code/sync.sh"
+
+  audit_jobs:
+    build:
+      context: ./
+      dockerfile: docker/Dockerfile
+    container_name: bq_jobs_audit
+    entrypoint: "/code/audit_jobs.sh"
+
+  audit_tables:
+    build:
+      context: ./
+      dockerfile: docker/Dockerfile
+    container_name: bq_tables_audit
+    entrypoint: "/code/audit_tables.sh"
