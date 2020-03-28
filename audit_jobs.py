@@ -1,3 +1,5 @@
+from __future__ import print_function
+
 import argparse
 import os
 import logging
@@ -16,7 +18,7 @@ from core.cmd import setup_logging, parse_table_name, load_api_key
 load_api_key()
 
 from google.cloud import bigquery, storage
-
+import json
 
 bq_client = bigquery.Client()
 
@@ -32,7 +34,7 @@ parser.add_argument('-f', '--output_file', metavar='output_file', dest='output_f
 parser.add_argument('-t', '--min_creation_time', metavar='min_creation_time', dest='min_creation_time', type=str,
                     default=None, help='the UTC timestamp since when to export jobs, with format YYYY-MM-DD_HH:MM:SS'
                                        '(default: auto - if output is a table, max creation timestamp exported from it,'
-                                       'otherwise 1 day back)')
+                                       'otherwise since the beginning)')
 
 parser.add_argument('--storage_project', metavar='storage_project', dest='storage_project', type=str, default=None,
                     help='the Google Cloud Storage project from where the results will be loaded into BigQuery '
@@ -139,22 +141,7 @@ if args.output_table is not None:
             raise RuntimeError('Schema of output table is incompatible with the required schema. Incompatibilities '
                                'found: %s\n\t *' % ('\n\t *'.join(schema_incompatibilities)))
 
-    # Default to the table project if the storage project is not defined.
-    storage_project = args.storage_project if args.storage_project is not None else target_project
-
-    storage_client = storage.Client(project=storage_project)
-
-    if args.storage_bucket is None:
-        raise RuntimeError("A Google Cloud Storage bucket name should be provided with option --storage_bucket in "
-                           "order to load results to table %s" % output_table.get_full_name())
-
-    if storage_client.lookup_bucket(args.storage_bucket) is None:
-        # Try creating the bucket instead of raising an exception.
-        storage_bucket = storage_client.create_bucket(args.storage_bucket)
-    else:
-        storage_bucket = storage_client.bucket(args.storage_bucket)
-
-    out_file = '_tmp_jobs_audit.csv'
+    out_file = '_tmp_jobs_audit_%s.csv' % datetime.now().strftime('%Y-%m-%d')
 else:
     out_file = args.output_file
 
@@ -163,34 +150,36 @@ min_creation_time = args.min_creation_time
 
 if min_creation_time is None:
     if output_table is not None:
-        q = QueryJobConfig()
-        q.use_legacy_sql = True
+        # q = QueryJobConfig()
+        # q.use_legacy_sql = True
+        #
+        # partitions_query = output_table.get_client().query(
+        #     "SELECT MAX(partition_id) AS partition_id FROM [%s$__PARTITIONS_SUMMARY__] "
+        #     "WHERE partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')" % output_table.get_full_name(),
+        #     job_config=q)
+        #
+        # partition_id = [row['partition_id'] for row in partitions_query.result()]
+        # partition_id = [partition for partition in partition_id if partition is not None]
+        #
+        # if len(partition_id) < 1:
+        #     pass
+        # else:
+        #     partition_date = datetime.strptime(partition_id[0], '%Y%m%d')
 
-        partitions_query = output_table.get_client().query(
-            "SELECT MAX(partition_id) AS partition_id FROM [%s$__PARTITIONS_SUMMARY__] "
-            "WHERE partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')" % output_table.get_full_name(),
-            job_config=q)
+        # max_ts_query = 'SELECT project_id, MAX(created) AS ts FROM %s ' \
+        #                'WHERE created >= "%s 00:00:00"' \
+        #                'GROUP BY project_id' % (
+        #     output_table.get_full_name(standard=True, quoted=True),
+        #     partition_date.strftime('%Y-%m-%d')
+        # )
 
-        partition_id = [row['partition_id'] for row in partitions_query.result()]
-        partition_id = [partition for partition in partition_id if partition is not None]
+        max_ts_query = 'SELECT project_id, MAX(created) AS ts ' \
+                       'FROM %s GROUP BY project_id' % (output_table.get_full_name(standard=True, quoted=True))
 
-        if len(partition_id) < 1:
-            pass
-        else:
-            partition_date = datetime.strptime(partition_id[0], '%Y%m%d')
+        max_ts_query = output_table.get_client().query(max_ts_query)
 
-            max_ts_query = 'SELECT project_id, MAX(created) AS ts FROM %s ' \
-                           'WHERE created >= "%s 00:00:00"' \
-                           'GROUP BY project_id' % (
-                output_table.get_full_name(standard=True, quoted=True),
-                partition_date.strftime('%Y-%m-%d')
-            )
+        min_creation_time = {row['project_id']: row['ts'] for row in max_ts_query.result()}
 
-            max_ts_query = output_table.get_client().query(max_ts_query)
-
-            min_creation_time = {row['project_id']: row['ts'] for row in max_ts_query.result()}
-    else:
-        min_creation_time = datetime.now() - timedelta(days=1)
 else:
     min_creation_time = datetime.strptime(min_creation_time, '%Y-%m-%d_%H:%M:%S')
 
@@ -205,31 +194,27 @@ with open(out_file, 'w') as f:
     writer.writeheader()
 
     for project in bq_client.list_projects():
-        print project.project_id
-
         creation_filter = min_creation_time
 
         if isinstance(min_creation_time, dict):
             if project.project_id in min_creation_time:
                 creation_filter = min_creation_time[project.project_id]
             else:
-                creation_filter = min(min_creation_time.values())
+                creation_filter = None
 
-        logging.debug('Fetching jobs since %s' % creation_filter)
+        logging.debug('Fetching jobs since %s for project %s' % (creation_filter, project.project_id))
 
         jobs = bq_client.list_jobs(project=project.project_id, state_filter='done',
                                    all_users=True, min_creation_time=creation_filter)
 
-        # for job in jobs:
-        #     job_info = process_job(job)
         for job_info in worker_pool.imap_unordered(process_job, jobs):
             if job_info:
                 try:
                     writer.writerow(job_info)
                     n_jobs_found += 1
-                except UnicodeEncodeError, ex:
+                except UnicodeEncodeError:
                     logging.warning('Failed to write a job')
-                    print job_info
+                    print(job_info)
 
     if n_jobs_found == 0:
         os.remove(out_file)
@@ -237,54 +222,73 @@ with open(out_file, 'w') as f:
 
 
 if output_table is not None and os.path.exists(out_file):
-    blob = storage_bucket.blob(out_file)
-
-    if blob.exists():
-        blob.delete()
-
-    logging.info('Uploading output to G-Cloud Storage...')
-    blob.upload_from_filename(out_file)
-    logging.info('Done uploading!')
-
-    blob_uri = 'gs://%s/%s' % (storage_bucket.name, blob.name)
-
+    # Create a load job configuration.
     job_config = LoadJobConfig()
     job_config.write_disposition = 'WRITE_APPEND'
     job_config.skip_leading_rows = 1
+    job_config.quote_character = '"'
     job_config.autodetect = True
 
-    logging.info('Loading output into table %s' % output_table.get_full_name())
-    load_job = bq_client.load_table_from_uri(blob_uri, output_table.reference, job_config=job_config)
+    file_size_mb = os.stat(out_file).st_size / (1024. * 1014)
 
-    result = load_job.result()
+    if file_size_mb < 9:
+        # Small files can be loaded directly from the Python API.
+        with open(out_file, 'rb') as load_file:
+            logging.info('Loading result into BQ table %s' % output_table.get_full_name())
+            load_job = bq_client.load_table_from_file(load_file,
+                                                      output_table.reference,
+                                                      job_config=job_config)
 
-    if result.errors and len(result.errors) > 0:
-        for e in result.errors:
-            print e
+            try:
+                load_job.result()
+            except Exception:
+                logging.error('Failed to load data into table. Errors: \n%s' % json.dumps(load_job.errors, indent=4))
+                raise RuntimeError('Failed to load data into table')
+    else:
+        # We need to use Google Cloud Storage and append to the table from a GCS URI.
 
-    # Perform cleanup.
+        # Default to the table project if the storage project is not defined.
+        storage_project = args.storage_project if args.storage_project is not None else output_table.project
+
+        storage_client = storage.Client(project=storage_project)
+
+        if args.storage_bucket is None:
+            raise RuntimeError("A Google Cloud Storage bucket name should be provided with option --storage_bucket in "
+                               "order to load results to table %s" % output_table.get_full_name())
+
+        if storage_client.lookup_bucket(args.storage_bucket) is None:
+            # Try creating the bucket instead of raising an exception.
+            storage_bucket = storage_client.create_bucket(args.storage_bucket)
+        else:
+            storage_bucket = storage_client.bucket(args.storage_bucket)
+
+        blob = storage_bucket.blob(out_file)
+
+        if blob.exists():
+            blob.delete()
+
+        logging.info('Uploading output to G-Cloud Storage...')
+        blob.upload_from_filename(out_file)
+        logging.info('Done uploading!')
+
+        blob_uri = 'gs://%s/%s' % (storage_bucket.name, blob.name)
+
+        logging.info('Loading output into table %s' % output_table.get_full_name())
+        load_job = bq_client.load_table_from_uri(blob_uri, output_table.reference, job_config=job_config)
+
+        result = load_job.result()
+
+        if result.errors and len(result.errors) > 0:
+            for e in result.errors:
+                logging.error(e)
+
+        # Perform cleanup.
+        try:
+            blob.delete()
+        except Forbidden:
+            logging.warning('Failed to delete Google Cloud Storage blob, maybe the API key is missing permissions?')
+
     os.remove(out_file)
-    try:
-        blob.delete()
-    except Forbidden, ex:
-        logging.warning('Failed to delete Google Cloud Storage blob, maybe the API key is missing permissions?')
 
     logging.info('Done!')
 
-
-# if output_table is not None and os.path.exists(out_file):
-#     with open(out_file, 'rb') as load_file:
-#         config = LoadJobConfig()
-#         config.write_disposition = 'WRITE_APPEND'
-#         config.skip_leading_rows = 1
-#         config.null_marker = 'None'
-#         config.quote_character = '"'
-#         logging.info('Loading result into BQ table %s' % output_table.get_full_name())
-#         load_job = bq_client.load_table_from_file(load_file, output_table.reference, job_config=config)
-#         try:
-#             load_job.result()
-#         except Exception, ex:
-#             logging.error('Failed to load data into table. Errors: %s' % '\n'.join(load_job.errors))
-#             raise RuntimeError('Failed to load data into table')
-#
-#     os.remove(out_file)

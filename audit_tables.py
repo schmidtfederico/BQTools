@@ -1,3 +1,4 @@
+from __future__ import print_function
 import os
 import logging
 import multiprocessing
@@ -184,10 +185,10 @@ with open(out_file, 'w') as out_f:
     out_f.flush()
 
     for project_idx, project in enumerate(bq_client.list_projects()):
-        print project.friendly_name
+        print(project.friendly_name)
 
         for idx, dataset in enumerate(bq_client.list_datasets(project.project_id)):
-            print '\t%02d:%03d: %s' % (project_idx+1, idx+1, dataset.full_dataset_id)
+            print('\t%02d:%03d: %s' % (project_idx+1, idx+1, dataset.full_dataset_id))
 
             rows_buffer = []
             dataset_info = {
@@ -222,7 +223,7 @@ if output_table is not None:
         load_job = bq_client.load_table_from_file(load_file, output_table.reference, job_config=config)
         try:
             load_job.result()
-        except Exception, ex:
+        except Exception:
             logging.error('Failed to load data into table. Errors: %s' % '\n'.join(load_job.errors))
             raise RuntimeError('Failed to load data into table')
 
